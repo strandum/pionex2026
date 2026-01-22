@@ -111,6 +111,7 @@ def pullback_signal_1m(
 
     c_2, c_1, c_0 = closes[-3], closes[-2], closes[-1]
 
+    # LONG in BULL: above -> dip to/below -> reclaim above VWAP
     if trend == "BULL":
         if (c_2 > vw) and (c_1 <= vw) and (c_0 > vw):
             entry = c_0
@@ -118,12 +119,92 @@ def pullback_signal_1m(
             tp = entry + (2.0 * a)
             return {"side": 1, "entry": entry, "sl": sl, "tp": tp, "atr": a, "vwap": vw}
 
+    # SHORT in BEAR: below -> pop to/above -> reject below VWAP
     if trend == "BEAR":
         if (c_2 < vw) and (c_1 >= vw) and (c_0 < vw):
             entry = c_0
             sl = entry + (1.2 * a)
             tp = entry - (2.0 * a)
             return {"side": -1, "entry": entry, "sl": sl, "tp": tp, "atr": a, "vwap": vw}
+
+    return None
+
+
+def near_setup_reason(
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    volumes: List[float],
+    trend: str,
+    vwap_lookback: int,
+    atr_period: int,
+    atr_min: float,
+    near_threshold_atr: float,
+) -> Optional[Dict[str, float]]:
+    """
+    Logger "nesten trade":
+    - Trend er BULL/BEAR
+    - Pris er nær VWAP (innen near_threshold_atr * ATR)
+    - Forklarer hva som mangler (reclaim/reject + sekvens)
+    """
+    if trend not in ("BULL", "BEAR"):
+        return None
+
+    vw = vwap(highs, lows, closes, volumes, lookback=vwap_lookback)
+    a = atr(highs, lows, closes, period=atr_period)
+    if vw is None or a is None:
+        return None
+    if a <= atr_min:
+        return None
+    if len(closes) < 3:
+        return None
+
+    c_2, c_1, c_0 = closes[-3], closes[-2], closes[-1]
+    dist = abs(c_0 - vw)
+
+    # Must be "near"
+    if dist > (near_threshold_atr * a):
+        return None
+
+    if trend == "BULL":
+        # Ideal: c_2 > vw, c_1 <= vw, c_0 > vw
+        missing = []
+        if not (c_2 > vw):
+            missing.append("need prior close above VWAP (c[-3] > VWAP)")
+        if not (c_1 <= vw):
+            missing.append("need pullback to/below VWAP (c[-2] <= VWAP)")
+        if not (c_0 > vw):
+            missing.append("need reclaim above VWAP (c[-1] > VWAP)")
+        return {
+            "side": 1,
+            "price": c_0,
+            "vwap": vw,
+            "atr": a,
+            "dist": dist,
+            "missing_count": float(len(missing)),
+            "missing_text": 0.0,  # placeholder for type consistency
+            "missing_str": " | ".join(missing) if missing else "very close (sequence not complete)",
+        }
+
+    if trend == "BEAR":
+        # Ideal: c_2 < vw, c_1 >= vw, c_0 < vw
+        missing = []
+        if not (c_2 < vw):
+            missing.append("need prior close below VWAP (c[-3] < VWAP)")
+        if not (c_1 >= vw):
+            missing.append("need pop to/above VWAP (c[-2] >= VWAP)")
+        if not (c_0 < vw):
+            missing.append("need reject below VWAP (c[-1] < VWAP)")
+        return {
+            "side": -1,
+            "price": c_0,
+            "vwap": vw,
+            "atr": a,
+            "dist": dist,
+            "missing_count": float(len(missing)),
+            "missing_text": 0.0,
+            "missing_str": " | ".join(missing) if missing else "very close (sequence not complete)",
+        }
 
     return None
 
@@ -180,13 +261,13 @@ class PionexClient:
         return self.private_get("/api/v1/account/balances")
 
 
-# ---------- Binance candles (with failover + debug) ----------
+# ---------- Binance candles (failover + debug) ----------
 class BinanceMarketData:
     def __init__(self, base_urls: List[str]):
         self.base_urls = [u.rstrip("/") for u in base_urls]
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (compatible; pionex2026/1.0; +https://render.com)",
+            "User-Agent": "Mozilla/5.0 (compatible; pionex2026/1.0)",
             "Accept": "application/json,text/plain,*/*",
         })
 
@@ -203,11 +284,9 @@ class BinanceMarketData:
             if not r.ok:
                 snippet = (r.text or "")[:160].replace("\n", " ")
                 return False, None, f"{base} -> HTTP {r.status_code} ct={ct} body='{snippet}'"
-
-            # Some blocks return HTML with 200 status; detect it
             if "text/html" in ct.lower():
                 snippet = (r.text or "")[:160].replace("\n", " ")
-                return False, None, f"{base} -> HTML response body='{snippet}'"
+                return False, None, f"{base} -> HTML body='{snippet}'"
 
             raw = r.json()
             if not isinstance(raw, list) or not raw:
@@ -225,7 +304,6 @@ class BinanceMarketData:
             return False, None, f"{base} exception: {e}"
 
     def get_klines(self, symbol: str, interval: str, limit: int) -> Optional[List[Dict[str, float]]]:
-        # Try each base URL a few times with light backoff
         last_reason = ""
         for attempt in range(1, 4):
             for base in self.base_urls:
@@ -239,7 +317,7 @@ class BinanceMarketData:
 
 
 def main():
-    logging.info("Booting Pionex bot (SIM STRATEGY D, Binance candles w/ failover)...")
+    logging.info("Booting Pionex bot (SIM STRATEGY D + NEAR SETUPS)...")
 
     api_key = require_env("PIONEX_API_KEY")
     api_secret = require_env("PIONEX_API_SECRET")
@@ -247,10 +325,12 @@ def main():
     trading_mode = os.getenv("TRADING_MODE", "paper")
     symbols = parse_symbols(os.getenv("SYMBOLS", "SOL/USDT,ARB/USDT"))
 
-    bot_enabled = env_bool("BOT_ENABLED", default=False)
+    # Guards (SIM-only)
+    bot_enabled = env_bool("BOT_ENABLED", default=False)  # keep false
     min_usdt_to_trade = float(os.getenv("MIN_USDT_TO_TRADE", "10"))
     max_trades_per_hour = int(os.getenv("MAX_TRADES_PER_HOUR", "6"))
 
+    # Strategy params
     vwap_lookback = int(os.getenv("VWAP_LOOKBACK", "100"))
     atr_period = int(os.getenv("ATR_PERIOD", "14"))
     atr_min = float(os.getenv("ATR_MIN", "0"))
@@ -258,7 +338,13 @@ def main():
     candle_limit_15m = int(os.getenv("CANDLE_LIMIT_15M", "260"))
     poll_seconds = int(os.getenv("POLL_SECONDS", "30"))
 
-    # failover list (you can override via env BINANCE_BASE_URLS)
+    # Near-setup tuning
+    near_threshold_atr = float(os.getenv("NEAR_THRESHOLD_ATR", "0.35"))  # how close to VWAP to call it "near"
+    near_cooldown_sec = int(os.getenv("NEAR_COOLDOWN_SEC", "300"))       # per symbol cooldown for near logs (default 5 min)
+
+    # Summary stats
+    summary_every_min = int(os.getenv("SUMMARY_EVERY_MIN", "15"))
+
     default_bases = [
         "https://api.binance.com",
         "https://api1.binance.com",
@@ -276,11 +362,29 @@ def main():
     logging.info(f"Symbols: {','.join(symbols)}")
     logging.info(f"Guards: BOT_ENABLED={bot_enabled}, MIN_USDT_TO_TRADE={min_usdt_to_trade}, MAX_TRADES_PER_HOUR={max_trades_per_hour}")
     logging.info(f"Strategy: EMA(50/200) on 15m, Pullback+VWAP on 1m, ATR({atr_period}), VWAP_LOOKBACK={vwap_lookback}")
+    logging.info(f"Near setups: NEAR_THRESHOLD_ATR={near_threshold_atr}, NEAR_COOLDOWN_SEC={near_cooldown_sec}")
+    logging.info(f"Summary: every {summary_every_min} min")
     logging.info(f"Market data bases: {', '.join(base_urls)}")
 
+    # per-symbol cooldown memory
+    last_near_log: Dict[str, int] = {s: 0 for s in symbols}
+
+    # stats
+    stats = {
+        "loops": 0,
+        "trend_bull": 0,
+        "trend_bear": 0,
+        "trend_no": 0,
+        "near": 0,
+        "signal": 0,
+    }
+    next_summary_ts = int(time.time()) + summary_every_min * 60
+
     while True:
+        stats["loops"] += 1
         usdt_free = 0.0
 
+        # balances
         try:
             r = pionex.get_balances()
             if r.get("result") is True:
@@ -295,8 +399,10 @@ def main():
         except Exception as e:
             logging.error(f"Balance check failed: {e}")
 
+        # strategy loop
         for sym in symbols:
             b_sym = to_binance_symbol(sym)
+
             c15 = market.get_klines(b_sym, interval="15m", limit=candle_limit_15m)
             c1 = market.get_klines(b_sym, interval="1m", limit=candle_limit_1m)
 
@@ -306,6 +412,13 @@ def main():
 
             closes_15 = [c["close"] for c in c15]
             trend = trend_state_15m(closes_15)
+
+            if trend == "BULL":
+                stats["trend_bull"] += 1
+            elif trend == "BEAR":
+                stats["trend_bear"] += 1
+            else:
+                stats["trend_no"] += 1
 
             highs_1 = [c["high"] for c in c1]
             lows_1 = [c["low"] for c in c1]
@@ -324,9 +437,9 @@ def main():
             )
 
             last_price = closes_1[-1]
-            if sig is None:
-                logging.info(f"[SIM] {sym}: TREND={trend} price={last_price}")
-            else:
+
+            if sig is not None:
+                stats["signal"] += 1
                 side = "BUY" if sig["side"] == 1 else "SELL"
                 logging.warning(
                     f"[SIM] SIGNAL {side} {sym} | TREND={trend} "
@@ -334,6 +447,46 @@ def main():
                     f"SL={sig['sl']:.6f} TP={sig['tp']:.6f} | "
                     f"USDT_free={usdt_free:.2f} BOT_ENABLED={bot_enabled} MODE={trading_mode}"
                 )
+                continue
+
+            # No signal -> maybe near setup?
+            now = int(time.time())
+            near = near_setup_reason(
+                highs=highs_1,
+                lows=lows_1,
+                closes=closes_1,
+                volumes=vols_1,
+                trend=trend,
+                vwap_lookback=vwap_lookback,
+                atr_period=atr_period,
+                atr_min=atr_min,
+                near_threshold_atr=near_threshold_atr,
+            )
+
+            if near is not None and (now - last_near_log.get(sym, 0) >= near_cooldown_sec):
+                stats["near"] += 1
+                last_near_log[sym] = now
+                side = "BUY" if near["side"] == 1 else "SELL"
+                logging.info(
+                    f"[SIM] NEAR SETUP {side} {sym} | TREND={trend} "
+                    f"price={near['price']:.6f} vwap={near['vwap']:.6f} atr={near['atr']:.6f} "
+                    f"dist_to_vwap={near['dist']:.6f} | missing: {near['missing_str']}"
+                )
+            else:
+                logging.info(f"[SIM] {sym}: TREND={trend} price={last_price}")
+
+        # summary every N minutes
+        now = int(time.time())
+        if now >= next_summary_ts:
+            logging.warning(
+                f"[SIM] SUMMARY last~{summary_every_min}m | "
+                f"loops={stats['loops']} trend(BULL/BEAR/NO)={stats['trend_bull']}/{stats['trend_bear']}/{stats['trend_no']} "
+                f"near={stats['near']} signals={stats['signal']} | "
+                f"BOT_ENABLED={bot_enabled} MODE={trading_mode}"
+            )
+            # reset window counters (keep loops rolling OK)
+            stats = {"loops": 0, "trend_bull": 0, "trend_bear": 0, "trend_no": 0, "near": 0, "signal": 0}
+            next_summary_ts = now + summary_every_min * 60
 
         if bot_enabled and trading_mode.strip().lower() == "live":
             logging.warning("Trading is ARMED but this build is SIM-only (no orders implemented yet).")
