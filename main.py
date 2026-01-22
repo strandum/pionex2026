@@ -25,28 +25,65 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 
 def parse_symbols(raw: str) -> List[str]:
-    # "SOL/USDT,ARB/USDT" -> ["SOL/USDT", "ARB/USDT"]
     parts = [p.strip() for p in raw.split(",")]
     return [p for p in parts if p]
 
 
 def normalize_symbol_variants(symbol: str) -> List[str]:
-    """
-    Pionex kan bruke ulike symbol-formater på public endpoints.
-    Vi prøver noen varianter for å gjøre det robust.
-    """
     s = symbol.strip()
     variants = [s]
     if "/" in s:
         variants.append(s.replace("/", "_"))  # SOL_USDT
-        variants.append(s.replace("/", ""))   # SOLUSDT (hvis noen bruker det)
-    return list(dict.fromkeys(variants))  # de-dupe
+        variants.append(s.replace("/", ""))   # SOLUSDT
+    return list(dict.fromkeys(variants))
 
 
+# ---------- indicators ----------
+def ema(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period or period <= 0:
+        return None
+    k = 2 / (period + 1)
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
+    if len(highs) < period + 1 or len(lows) < period + 1 or len(closes) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    # simple ATR (SMA of TR) is fine for our use
+    return sum(trs[-period:]) / period
+
+
+def vwap(highs: List[float], lows: List[float], closes: List[float], volumes: List[float], lookback: int = 100) -> Optional[float]:
+    n = min(lookback, len(closes))
+    if n <= 5:
+        return None
+    tpv = 0.0
+    vol = 0.0
+    for i in range(len(closes) - n, len(closes)):
+        typical = (highs[i] + lows[i] + closes[i]) / 3.0
+        v = volumes[i]
+        tpv += typical * v
+        vol += v
+    if vol <= 0:
+        return None
+    return tpv / vol
+
+
+# ---------- Pionex client ----------
 class PionexClient:
-    """
-    Minimal Pionex REST client for PRIVATE GET endpoints (read-only) + PUBLIC GET for priser.
-    """
     def __init__(self, api_key: str, api_secret: str, base_url: str = "https://api.pionex.com"):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -90,26 +127,18 @@ class PionexClient:
         url = f"{self.base_url}{path}?{query}"
 
         resp = self.session.get(url, headers=headers, timeout=15)
-        try:
-            data = resp.json()
-        except Exception:
-            raise RuntimeError(f"Non-JSON response (status={resp.status_code}): {resp.text[:200]}")
-
+        data = resp.json()
         if not resp.ok:
             raise RuntimeError(f"HTTP {resp.status_code}: {data}")
         return data
 
     def public_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        # Public endpoints trenger normalt ikke signatur
         query = ""
         if params:
             query = self._build_sorted_query(params)
         url = f"{self.base_url}{path}" + (f"?{query}" if query else "")
         resp = self.session.get(url, timeout=15)
-        try:
-            data = resp.json()
-        except Exception:
-            raise RuntimeError(f"Non-JSON public response (status={resp.status_code}): {resp.text[:200]}")
+        data = resp.json()
         if not resp.ok:
             raise RuntimeError(f"HTTP {resp.status_code} (public): {data}")
         return data
@@ -118,21 +147,12 @@ class PionexClient:
         return self.private_get("/api/v1/account/balances")
 
     def get_prices_best_effort(self, symbols: List[str]) -> Dict[str, float]:
-        """
-        Henter priser på en robust måte:
-        - Prøver å hente alle tickers, og filtrerer (hvis endpointet finnes)
-        - Hvis det feiler, prøver vi symbol-spesifikk ticker (hvis endpointet finnes)
-        Returnerer dict: { "SOL/USDT": price, ... } (for de vi klarer)
-        """
-        # 1) Prøv "alle tickers"-variant
         prices: Dict[str, float] = {}
         try:
-            # Noen API-er har /api/v1/market/tickers
             r = self.public_get("/api/v1/market/tickers")
             if r.get("result") is True:
                 data = r.get("data") or {}
                 tickers = data.get("tickers") or data.get("data") or data.get("list") or []
-                # tickers forventes å være liste av dicts med symbol + last/close
                 for sym in symbols:
                     for variant in normalize_symbol_variants(sym):
                         for t in tickers:
@@ -140,136 +160,311 @@ class PionexClient:
                             if ts == variant:
                                 last = t.get("last") or t.get("close") or t.get("price")
                                 if last is not None:
-                                    try:
-                                        prices[sym] = float(last)
-                                        break
-                                    except Exception:
-                                        pass
+                                    prices[sym] = float(last)
+                                    break
                         if sym in prices:
                             break
         except Exception as e:
             logging.info(f"Public tickers endpoint not usable (ok): {e}")
 
-        # 2) Hvis vi mangler noen, prøv symbol-spesifikt
         missing = [s for s in symbols if s not in prices]
         for sym in missing:
-            ok = False
             for variant in normalize_symbol_variants(sym):
                 try:
-                    # Noen API-er har /api/v1/market/ticker?symbol=...
                     r = self.public_get("/api/v1/market/ticker", params={"symbol": variant})
                     if r.get("result") is True:
                         data = r.get("data") or {}
                         last = data.get("last") or data.get("close") or data.get("price")
                         if last is not None:
                             prices[sym] = float(last)
-                            ok = True
                             break
                 except Exception:
                     continue
-            if not ok:
-                logging.warning(f"Could not fetch price for {sym} (tried variants).")
-
         return prices
 
+    def get_candles_best_effort(self, symbol: str, interval: str, limit: int) -> Optional[List[Dict[str, float]]]:
+        """
+        Returnerer liste av candles i stigende rekkefølge:
+        [{open, high, low, close, volume}, ...]
+        Best-effort: prøver flere endpoints/parameternavn.
+        """
+        endpoints = [
+            ("/api/v1/market/klines", {"symbol": None, "interval": None, "limit": None}),
+            ("/api/v1/market/kline", {"symbol": None, "interval": None, "limit": None}),
+            ("/api/v1/market/candles", {"symbol": None, "interval": None, "limit": None}),
+            ("/api/v1/market/klines", {"symbol": None, "type": None, "size": None}),   # alternative param names
+            ("/api/v1/market/candles", {"symbol": None, "type": None, "size": None}),
+        ]
 
-class TradeGuard:
+        interval_variants = [interval]
+        # common aliases
+        if interval == "1m":
+            interval_variants += ["1min", "1", "60"]
+        if interval == "15m":
+            interval_variants += ["15min", "15", "900"]
+
+        for sym_variant in normalize_symbol_variants(symbol):
+            for intv in interval_variants:
+                for path, param_template in endpoints:
+                    params = {}
+                    for k in param_template.keys():
+                        if k == "symbol":
+                            params[k] = sym_variant
+                        elif k in ("interval", "type"):
+                            params[k] = intv
+                        elif k == "limit":
+                            params[k] = limit
+                        elif k == "size":
+                            params[k] = limit
+                    try:
+                        r = self.public_get(path, params=params)
+                        if r.get("result") is not True:
+                            continue
+                        data = r.get("data") or {}
+
+                        raw = (
+                            data.get("klines")
+                            or data.get("kline")
+                            or data.get("candles")
+                            or data.get("data")
+                            or data.get("list")
+                            or []
+                        )
+
+                        # raw kan være liste av lister eller liste av dicts
+                        candles: List[Dict[str, float]] = []
+
+                        if not isinstance(raw, list) or len(raw) == 0:
+                            continue
+
+                        # Case A: list of dicts
+                        if isinstance(raw[0], dict):
+                            for c in raw:
+                                try:
+                                    candles.append({
+                                        "open": float(c.get("open")),
+                                        "high": float(c.get("high")),
+                                        "low": float(c.get("low")),
+                                        "close": float(c.get("close")),
+                                        "volume": float(c.get("volume") or c.get("vol") or 0.0),
+                                    })
+                                except Exception:
+                                    continue
+
+                        # Case B: list of lists (common: [time, open, close, high, low, volume] OR other order)
+                        elif isinstance(raw[0], (list, tuple)) and len(raw[0]) >= 6:
+                            # We'll try a couple of common layouts:
+                            # L1: [time, open, close, high, low, volume]
+                            # L2: [time, open, high, low, close, volume]
+                            for row in raw:
+                                try:
+                                    # pick by heuristic: high should be >= open/close/low
+                                    t, a, b, c, d, v = row[:6]
+                                    f = list(map(float, [a, b, c, d, v]))
+                                    o1, x1, y1, z1, vol1 = f
+                                    # layout L1: open, close, high, low
+                                    # layout L2: open, high, low, close
+                                    # test L1
+                                    o = o1
+                                    close_l1 = x1
+                                    high_l1 = y1
+                                    low_l1 = z1
+                                    score_l1 = (high_l1 >= max(o, close_l1, low_l1)) and (low_l1 <= min(o, close_l1, high_l1))
+                                    # test L2
+                                    high_l2 = x1
+                                    low_l2 = y1
+                                    close_l2 = z1
+                                    score_l2 = (high_l2 >= max(o, close_l2, low_l2)) and (low_l2 <= min(o, close_l2, high_l2))
+
+                                    if score_l2 and not score_l1:
+                                        candles.append({"open": o, "high": high_l2, "low": low_l2, "close": close_l2, "volume": vol1})
+                                    else:
+                                        candles.append({"open": o, "high": high_l1, "low": low_l1, "close": close_l1, "volume": vol1})
+                                except Exception:
+                                    continue
+                        else:
+                            continue
+
+                        if len(candles) >= 50:
+                            return candles[-limit:]  # newest slice, still chronological in most APIs
+                    except Exception:
+                        continue
+
+        return None
+
+
+# ---------- Strategy (D) ----------
+def trend_state_15m(closes_15m: List[float]) -> str:
+    e50 = ema(closes_15m, 50)
+    e200 = ema(closes_15m, 200)
+    if e50 is None or e200 is None:
+        return "NO_TRADE"
+    last = closes_15m[-1]
+    if e50 > e200 and last > e50 and last > e200:
+        return "BULL"
+    if e50 < e200 and last < e50 and last < e200:
+        return "BEAR"
+    return "NO_TRADE"
+
+
+def pullback_signal_1m(
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    volumes: List[float],
+    trend: str,
+    vwap_lookback: int = 100,
+    atr_period: int = 14,
+    atr_min: float = 0.0,
+) -> Optional[Dict[str, float]]:
     """
-    Enkle guardrails:
-    - Kill switch (BOT_ENABLED)
-    - Trading mode må være 'live' for å plassere ordre (vi plasserer ikke ordre i denne versjonen)
-    - Minimum USDT før vi i det hele tatt vurderer trading
-    - Rate limit (maks trades per time) – forberedt til senere
+    Returnerer signal dict:
+    {"side": 1/-1, "entry":..., "sl":..., "tp":..., "atr":..., "vwap":...}
     """
-    def __init__(self, min_usdt_to_trade: float, max_trades_per_hour: int):
-        self.min_usdt_to_trade = min_usdt_to_trade
-        self.max_trades_per_hour = max_trades_per_hour
-        self.trade_timestamps: List[int] = []
+    vw = vwap(highs, lows, closes, volumes, lookback=vwap_lookback)
+    a = atr(highs, lows, closes, period=atr_period)
+    if vw is None or a is None:
+        return None
+    if a <= atr_min:
+        return None
 
-    def can_trade(self, bot_enabled: bool, trading_mode: str, usdt_free: float) -> Tuple[bool, str]:
-        if not bot_enabled:
-            return False, "BOT_ENABLED=false (kill-switch aktiv)"
-        if trading_mode.strip().lower() != "live":
-            return False, f"TRADING_MODE={trading_mode} (ikke live)"
-        if usdt_free < self.min_usdt_to_trade:
-            return False, f"USDT free {usdt_free:.4f} < MIN_USDT_TO_TRADE {self.min_usdt_to_trade:.2f}"
-        # rate limit (til senere)
-        now = int(time.time())
-        one_hour_ago = now - 3600
-        self.trade_timestamps = [t for t in self.trade_timestamps if t >= one_hour_ago]
-        if len(self.trade_timestamps) >= self.max_trades_per_hour:
-            return False, f"Rate limit: {len(self.trade_timestamps)}/{self.max_trades_per_hour} trades siste time"
-        return True, "OK"
+    # use last 3 closes for a simple pullback/cross pattern
+    if len(closes) < 3:
+        return None
+    c_2, c_1, c_0 = closes[-3], closes[-2], closes[-1]
 
-    def record_trade(self):
-        self.trade_timestamps.append(int(time.time()))
+    # LONG in BULL: was above VWAP, dipped to/below VWAP, then reclaimed above VWAP
+    if trend == "BULL":
+        was_above = c_2 > vw
+        dipped = c_1 <= vw
+        reclaimed = c_0 > vw
+        if was_above and dipped and reclaimed:
+            entry = c_0
+            sl = entry - (1.2 * a)
+            tp = entry + (2.0 * a)
+            return {"side": 1, "entry": entry, "sl": sl, "tp": tp, "atr": a, "vwap": vw}
+
+    # SHORT in BEAR: was below VWAP, popped to/above VWAP, then rejected below VWAP
+    if trend == "BEAR":
+        was_below = c_2 < vw
+        popped = c_1 >= vw
+        rejected = c_0 < vw
+        if was_below and popped and rejected:
+            entry = c_0
+            sl = entry + (1.2 * a)
+            tp = entry - (2.0 * a)
+            return {"side": -1, "entry": entry, "sl": sl, "tp": tp, "atr": a, "vwap": vw}
+
+    return None
 
 
 def main():
-    logging.info("Booting Pionex bot (READ-ONLY + PRICES + GUARDS)...")
+    logging.info("Booting Pionex bot (SIM STRATEGY D)...")
 
     api_key = require_env("PIONEX_API_KEY")
     api_secret = require_env("PIONEX_API_SECRET")
 
     trading_mode = os.getenv("TRADING_MODE", "paper")
     symbols = parse_symbols(os.getenv("SYMBOLS", "SOL/USDT,ARB/USDT"))
-    max_usdt_per_trade = float(os.getenv("MAX_USDT_PER_TRADE", "20"))
-    max_daily_loss = float(os.getenv("MAX_DAILY_LOSS_USDT", "10"))
 
     # Guardrails
-    bot_enabled = env_bool("BOT_ENABLED", default=False)  # default OFF for safety
+    bot_enabled = env_bool("BOT_ENABLED", default=False)  # keep OFF for now
     min_usdt_to_trade = float(os.getenv("MIN_USDT_TO_TRADE", "10"))
     max_trades_per_hour = int(os.getenv("MAX_TRADES_PER_HOUR", "6"))
 
+    # Strategy params (safe defaults)
+    vwap_lookback = int(os.getenv("VWAP_LOOKBACK", "100"))
+    atr_period = int(os.getenv("ATR_PERIOD", "14"))
+    atr_min = float(os.getenv("ATR_MIN", "0"))  # you can raise later if too noisy
+    candle_limit_1m = int(os.getenv("CANDLE_LIMIT_1M", "240"))
+    candle_limit_15m = int(os.getenv("CANDLE_LIMIT_15M", "260"))  # needs >=200 for EMA200
+    poll_seconds = int(os.getenv("POLL_SECONDS", "30"))
+
     logging.info(f"Mode: {trading_mode}")
     logging.info(f"Symbols: {','.join(symbols)}")
-    logging.info(f"Risk: max_usdt_per_trade={max_usdt_per_trade}, max_daily_loss={max_daily_loss}")
     logging.info(f"Guards: BOT_ENABLED={bot_enabled}, MIN_USDT_TO_TRADE={min_usdt_to_trade}, MAX_TRADES_PER_HOUR={max_trades_per_hour}")
+    logging.info(f"Strategy: EMA(50/200) on 15m, Pullback+VWAP on 1m, ATR({atr_period}), VWAP_LOOKBACK={vwap_lookback}")
 
     client = PionexClient(api_key=api_key, api_secret=api_secret)
-    guard = TradeGuard(min_usdt_to_trade=min_usdt_to_trade, max_trades_per_hour=max_trades_per_hour)
 
     while True:
+        # balances (for info only in sim mode)
         usdt_free = 0.0
-
-        # 1) Balances (private)
         try:
             r = client.get_balances()
-            if r.get("result") is not True:
-                logging.warning(f"Balances result=false: {r}")
-            else:
+            if r.get("result") is True:
                 balances = (r.get("data") or {}).get("balances", [])
                 for b in balances:
                     if b.get("coin") == "USDT":
-                        try:
-                            usdt_free = float(b.get("free", 0))
-                        except Exception:
-                            usdt_free = 0.0
+                        usdt_free = float(b.get("free", 0) or 0)
                         logging.info(f"Balances: USDT free={usdt_free} frozen={b.get('frozen')}")
                         break
+            else:
+                logging.warning(f"Balances result=false: {r}")
         except Exception as e:
             logging.error(f"Balance check failed: {e}")
 
-        # 2) Prices (public)
+        # prices (nice-to-have)
         try:
             prices = client.get_prices_best_effort(symbols)
             if prices:
                 pretty = " | ".join([f"{s}={prices[s]}" for s in prices])
                 logging.info(f"Prices: {pretty}")
-            else:
-                logging.warning("Prices: could not fetch any prices (public endpoints may differ).")
         except Exception as e:
             logging.error(f"Price fetch failed: {e}")
 
-        # 3) Trading gate (ingen ordre i denne versjonen, men vi logger om vi ville vært 'armed')
-        ok, reason = guard.can_trade(bot_enabled=bot_enabled, trading_mode=trading_mode, usdt_free=usdt_free)
-        if ok:
-            logging.warning("Trading is ARMED (live + enabled + min balance). Still NOT placing orders in this version.")
+        # SIM signals per symbol
+        for sym in symbols:
+            try:
+                c15 = client.get_candles_best_effort(sym, interval="15m", limit=candle_limit_15m)
+                c1 = client.get_candles_best_effort(sym, interval="1m", limit=candle_limit_1m)
+
+                if not c15 or not c1:
+                    logging.warning(f"[SIM] {sym}: candle fetch failed (15m={bool(c15)} 1m={bool(c1)}).")
+                    continue
+
+                closes_15 = [c["close"] for c in c15]
+                trend = trend_state_15m(closes_15)
+
+                highs_1 = [c["high"] for c in c1]
+                lows_1 = [c["low"] for c in c1]
+                closes_1 = [c["close"] for c in c1]
+                vols_1 = [c["volume"] for c in c1]
+
+                sig = pullback_signal_1m(
+                    highs=highs_1,
+                    lows=lows_1,
+                    closes=closes_1,
+                    volumes=vols_1,
+                    trend=trend,
+                    vwap_lookback=vwap_lookback,
+                    atr_period=atr_period,
+                    atr_min=atr_min,
+                )
+
+                last_price = closes_1[-1]
+                if sig is None:
+                    logging.info(f"[SIM] {sym}: TREND={trend} price={last_price}")
+                else:
+                    side = "BUY" if sig["side"] == 1 else "SELL"
+                    logging.warning(
+                        f"[SIM] SIGNAL {side} {sym} | TREND={trend} "
+                        f"entry={sig['entry']:.6f} vwap={sig['vwap']:.6f} atr={sig['atr']:.6f} "
+                        f"SL={sig['sl']:.6f} TP={sig['tp']:.6f} | "
+                        f"USDT_free={usdt_free:.2f} BOT_ENABLED={bot_enabled} MODE={trading_mode}"
+                    )
+
+            except Exception as e:
+                logging.error(f"[SIM] {sym}: strategy loop error: {e}")
+
+        # trading gate (still NO orders)
+        if bot_enabled and trading_mode.strip().lower() == "live":
+            logging.warning("Trading is ARMED but this build is SIM-only (no orders implemented yet).")
         else:
-            logging.info(f"Trading disabled: {reason}")
+            logging.info("Trading disabled (SIM-only / guards).")
 
         logging.info("Heartbeat: bot is alive.")
-        time.sleep(30)
+        time.sleep(poll_seconds)
 
 
 if __name__ == "__main__":
