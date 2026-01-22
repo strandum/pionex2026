@@ -3,7 +3,7 @@ import time
 import hmac
 import hashlib
 import logging
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List
 
 import requests
 
@@ -29,18 +29,9 @@ def parse_symbols(raw: str) -> List[str]:
     return [p for p in parts if p]
 
 
-def normalize_symbol_variants(symbol: str) -> List[str]:
-    s = symbol.strip()
-    variants = [s]
-    if "/" in s:
-        variants.append(s.replace("/", "_"))  # SOL_USDT
-        variants.append(s.replace("/", ""))   # SOLUSDT
-    return list(dict.fromkeys(variants))
-
-
 # ---------- indicators ----------
 def ema(values: List[float], period: int) -> Optional[float]:
-    if len(values) < period or period <= 0:
+    if period <= 0 or len(values) < period:
         return None
     k = 2 / (period + 1)
     e = values[0]
@@ -52,7 +43,7 @@ def ema(values: List[float], period: int) -> Optional[float]:
 def atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
     if len(highs) < period + 1 or len(lows) < period + 1 or len(closes) < period + 1:
         return None
-    trs = []
+    trs: List[float] = []
     for i in range(1, len(closes)):
         tr = max(
             highs[i] - lows[i],
@@ -62,7 +53,6 @@ def atr(highs: List[float], lows: List[float], closes: List[float], period: int 
         trs.append(tr)
     if len(trs) < period:
         return None
-    # simple ATR (SMA of TR) is fine for our use
     return sum(trs[-period:]) / period
 
 
@@ -82,8 +72,67 @@ def vwap(highs: List[float], lows: List[float], closes: List[float], volumes: Li
     return tpv / vol
 
 
+# ----------(SIM): trend + pullback signal
+def trend_state_15m(closes_15m: List[float]) -> str:
+    e50 = ema(closes_15m, 50)
+    e200 = ema(closes_15m, 200)
+    if e50 is None or e200 is None:
+        return "NO_TRADE"
+    last = closes_15m[-1]
+    if e50 > e200 and last > e50 and last > e200:
+        return "BULL"
+    if e50 < e200 and last < e50 and last < e200:
+        return "BEAR"
+    return "NO_TRADE"
+
+
+def pullback_signal_1m(
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    volumes: List[float],
+    trend: str,
+    vwap_lookback: int = 100,
+    atr_period: int = 14,
+    atr_min: float = 0.0,
+) -> Optional[Dict[str, float]]:
+    vw = vwap(highs, lows, closes, volumes, lookback=vwap_lookback)
+    a = atr(highs, lows, closes, period=atr_period)
+    if vw is None or a is None:
+        return None
+    if a <= atr_min:
+        return None
+    if len(closes) < 3:
+        return None
+
+    c_2, c_1, c_0 = closes[-3], closes[-2], closes[-1]
+
+    # LONG in BULL: above -> dip to/below -> reclaim above VWAP
+    if trend == "BULL":
+        if (c_2 > vw) and (c_1 <= vw) and (c_0 > vw):
+            entry = c_0
+            sl = entry - (1.2 * a)
+            tp = entry + (2.0 * a)
+            return {"side": 1, "entry": entry, "sl": sl, "tp": tp, "atr": a, "vwap": vw}
+
+    # SHORT in BEAR: below -> pop to/above -> reject below VWAP
+    if trend == "BEAR":
+        if (c_2 < vw) and (c_1 >= vw) and (c_0 < vw):
+            entry = c_0
+            sl = entry + (1.2 * a)
+            tp = entry - (2.0 * a)
+            return {"side": -1, "entry": entry, "sl": sl, "tp": tp, "atr": a, "vwap": vw}
+
+    return None
+
+
 # ---------- Pionex client ----------
 class PionexClient:
+    """
+    Minimal Pionex client:
+    - Private GET for balances (signed)
+    - Public GET for tickers + klines (no signature)
+    """
     def __init__(self, api_key: str, api_secret: str, base_url: str = "https://api.pionex.com"):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -143,219 +192,70 @@ class PionexClient:
             raise RuntimeError(f"HTTP {resp.status_code} (public): {data}")
         return data
 
+    # private
     def get_balances(self) -> Dict[str, Any]:
         return self.private_get("/api/v1/account/balances")
 
-    def get_prices_best_effort(self, symbols: List[str]) -> Dict[str, float]:
+    # public
+    def get_prices(self, symbols: List[str]) -> Dict[str, float]:
+        """
+        Uses market/tickers and filters in-code. Your logs showed this already works.
+        """
         prices: Dict[str, float] = {}
-        try:
-            r = self.public_get("/api/v1/market/tickers")
-            if r.get("result") is True:
-                data = r.get("data") or {}
-                tickers = data.get("tickers") or data.get("data") or data.get("list") or []
-                for sym in symbols:
-                    for variant in normalize_symbol_variants(sym):
-                        for t in tickers:
-                            ts = t.get("symbol") or t.get("symbolName") or t.get("market")
-                            if ts == variant:
-                                last = t.get("last") or t.get("close") or t.get("price")
-                                if last is not None:
-                                    prices[sym] = float(last)
-                                    break
-                        if sym in prices:
-                            break
-        except Exception as e:
-            logging.info(f"Public tickers endpoint not usable (ok): {e}")
+        r = self.public_get("/api/v1/market/tickers")
+        if r.get("result") is not True:
+            return prices
+        data = r.get("data") or {}
+        tickers = data.get("tickers") or data.get("data") or data.get("list") or []
+        if not isinstance(tickers, list):
+            return prices
 
-        missing = [s for s in symbols if s not in prices]
-        for sym in missing:
-            for variant in normalize_symbol_variants(sym):
-                try:
-                    r = self.public_get("/api/v1/market/ticker", params={"symbol": variant})
-                    if r.get("result") is True:
-                        data = r.get("data") or {}
-                        last = data.get("last") or data.get("close") or data.get("price")
-                        if last is not None:
-                            prices[sym] = float(last)
-                            break
-                except Exception:
-                    continue
+        wanted = {s.replace("/", "_"): s for s in symbols}  # SOL_USDT -> SOL/USDT
+        for t in tickers:
+            ts = t.get("symbol") or t.get("symbolName") or t.get("market")
+            if ts in wanted:
+                last = t.get("last") or t.get("close") or t.get("price")
+                if last is not None:
+                    prices[wanted[ts]] = float(last)
         return prices
 
-    def get_candles_best_effort(self, symbol: str, interval: str, limit: int) -> Optional[List[Dict[str, float]]]:
+    def get_candles(self, symbol: str, interval_seconds: int, limit: int) -> Optional[List[Dict[str, float]]]:
         """
-        Returnerer liste av candles i stigende rekkefølge:
-        [{open, high, low, close, volume}, ...]
-        Best-effort: prøver flere endpoints/parameternavn.
+        Pionex klines:
+          GET /api/v1/market/klines?symbol=SOL_USDT&interval=60&limit=200
+        Returns rows like: [time, open, close, high, low, volume]
         """
-        endpoints = [
-            ("/api/v1/market/klines", {"symbol": None, "interval": None, "limit": None}),
-            ("/api/v1/market/kline", {"symbol": None, "interval": None, "limit": None}),
-            ("/api/v1/market/candles", {"symbol": None, "interval": None, "limit": None}),
-            ("/api/v1/market/klines", {"symbol": None, "type": None, "size": None}),   # alternative param names
-            ("/api/v1/market/candles", {"symbol": None, "type": None, "size": None}),
-        ]
+        sym = symbol.replace("/", "_")  # SOL_USDT
+        r = self.public_get(
+            "/api/v1/market/klines",
+            params={"symbol": sym, "interval": interval_seconds, "limit": limit},
+        )
+        if r.get("result") is not True:
+            return None
 
-        interval_variants = [interval]
-        # common aliases
-        if interval == "1m":
-            interval_variants += ["1min", "1", "60"]
-        if interval == "15m":
-            interval_variants += ["15min", "15", "900"]
+        raw = (r.get("data") or {}).get("klines")
+        if raw is None:
+            # some APIs return list directly in data
+            raw = r.get("data")
+        if not isinstance(raw, list) or not raw:
+            return None
 
-        for sym_variant in normalize_symbol_variants(symbol):
-            for intv in interval_variants:
-                for path, param_template in endpoints:
-                    params = {}
-                    for k in param_template.keys():
-                        if k == "symbol":
-                            params[k] = sym_variant
-                        elif k in ("interval", "type"):
-                            params[k] = intv
-                        elif k == "limit":
-                            params[k] = limit
-                        elif k == "size":
-                            params[k] = limit
-                    try:
-                        r = self.public_get(path, params=params)
-                        if r.get("result") is not True:
-                            continue
-                        data = r.get("data") or {}
+        candles: List[Dict[str, float]] = []
+        for row in raw:
+            if not isinstance(row, (list, tuple)) or len(row) < 6:
+                continue
+            _, o, c, h, l, v = row[:6]
+            candles.append({
+                "open": float(o),
+                "high": float(h),
+                "low": float(l),
+                "close": float(c),
+                "volume": float(v),
+            })
 
-                        raw = (
-                            data.get("klines")
-                            or data.get("kline")
-                            or data.get("candles")
-                            or data.get("data")
-                            or data.get("list")
-                            or []
-                        )
-
-                        # raw kan være liste av lister eller liste av dicts
-                        candles: List[Dict[str, float]] = []
-
-                        if not isinstance(raw, list) or len(raw) == 0:
-                            continue
-
-                        # Case A: list of dicts
-                        if isinstance(raw[0], dict):
-                            for c in raw:
-                                try:
-                                    candles.append({
-                                        "open": float(c.get("open")),
-                                        "high": float(c.get("high")),
-                                        "low": float(c.get("low")),
-                                        "close": float(c.get("close")),
-                                        "volume": float(c.get("volume") or c.get("vol") or 0.0),
-                                    })
-                                except Exception:
-                                    continue
-
-                        # Case B: list of lists (common: [time, open, close, high, low, volume] OR other order)
-                        elif isinstance(raw[0], (list, tuple)) and len(raw[0]) >= 6:
-                            # We'll try a couple of common layouts:
-                            # L1: [time, open, close, high, low, volume]
-                            # L2: [time, open, high, low, close, volume]
-                            for row in raw:
-                                try:
-                                    # pick by heuristic: high should be >= open/close/low
-                                    t, a, b, c, d, v = row[:6]
-                                    f = list(map(float, [a, b, c, d, v]))
-                                    o1, x1, y1, z1, vol1 = f
-                                    # layout L1: open, close, high, low
-                                    # layout L2: open, high, low, close
-                                    # test L1
-                                    o = o1
-                                    close_l1 = x1
-                                    high_l1 = y1
-                                    low_l1 = z1
-                                    score_l1 = (high_l1 >= max(o, close_l1, low_l1)) and (low_l1 <= min(o, close_l1, high_l1))
-                                    # test L2
-                                    high_l2 = x1
-                                    low_l2 = y1
-                                    close_l2 = z1
-                                    score_l2 = (high_l2 >= max(o, close_l2, low_l2)) and (low_l2 <= min(o, close_l2, high_l2))
-
-                                    if score_l2 and not score_l1:
-                                        candles.append({"open": o, "high": high_l2, "low": low_l2, "close": close_l2, "volume": vol1})
-                                    else:
-                                        candles.append({"open": o, "high": high_l1, "low": low_l1, "close": close_l1, "volume": vol1})
-                                except Exception:
-                                    continue
-                        else:
-                            continue
-
-                        if len(candles) >= 50:
-                            return candles[-limit:]  # newest slice, still chronological in most APIs
-                    except Exception:
-                        continue
-
-        return None
-
-
-# ---------- Strategy (D) ----------
-def trend_state_15m(closes_15m: List[float]) -> str:
-    e50 = ema(closes_15m, 50)
-    e200 = ema(closes_15m, 200)
-    if e50 is None or e200 is None:
-        return "NO_TRADE"
-    last = closes_15m[-1]
-    if e50 > e200 and last > e50 and last > e200:
-        return "BULL"
-    if e50 < e200 and last < e50 and last < e200:
-        return "BEAR"
-    return "NO_TRADE"
-
-
-def pullback_signal_1m(
-    highs: List[float],
-    lows: List[float],
-    closes: List[float],
-    volumes: List[float],
-    trend: str,
-    vwap_lookback: int = 100,
-    atr_period: int = 14,
-    atr_min: float = 0.0,
-) -> Optional[Dict[str, float]]:
-    """
-    Returnerer signal dict:
-    {"side": 1/-1, "entry":..., "sl":..., "tp":..., "atr":..., "vwap":...}
-    """
-    vw = vwap(highs, lows, closes, volumes, lookback=vwap_lookback)
-    a = atr(highs, lows, closes, period=atr_period)
-    if vw is None or a is None:
-        return None
-    if a <= atr_min:
-        return None
-
-    # use last 3 closes for a simple pullback/cross pattern
-    if len(closes) < 3:
-        return None
-    c_2, c_1, c_0 = closes[-3], closes[-2], closes[-1]
-
-    # LONG in BULL: was above VWAP, dipped to/below VWAP, then reclaimed above VWAP
-    if trend == "BULL":
-        was_above = c_2 > vw
-        dipped = c_1 <= vw
-        reclaimed = c_0 > vw
-        if was_above and dipped and reclaimed:
-            entry = c_0
-            sl = entry - (1.2 * a)
-            tp = entry + (2.0 * a)
-            return {"side": 1, "entry": entry, "sl": sl, "tp": tp, "atr": a, "vwap": vw}
-
-    # SHORT in BEAR: was below VWAP, popped to/above VWAP, then rejected below VWAP
-    if trend == "BEAR":
-        was_below = c_2 < vw
-        popped = c_1 >= vw
-        rejected = c_0 < vw
-        if was_below and popped and rejected:
-            entry = c_0
-            sl = entry + (1.2 * a)
-            tp = entry - (2.0 * a)
-            return {"side": -1, "entry": entry, "sl": sl, "tp": tp, "atr": a, "vwap": vw}
-
-    return None
+        if len(candles) < 50:
+            return None
+        return candles
 
 
 def main():
@@ -367,29 +267,30 @@ def main():
     trading_mode = os.getenv("TRADING_MODE", "paper")
     symbols = parse_symbols(os.getenv("SYMBOLS", "SOL/USDT,ARB/USDT"))
 
-    # Guardrails
-    bot_enabled = env_bool("BOT_ENABLED", default=False)  # keep OFF for now
+    # Guardrails (still SIM-only, but keep for safety)
+    bot_enabled = env_bool("BOT_ENABLED", default=False)  # keep false
     min_usdt_to_trade = float(os.getenv("MIN_USDT_TO_TRADE", "10"))
     max_trades_per_hour = int(os.getenv("MAX_TRADES_PER_HOUR", "6"))
 
-    # Strategy params (safe defaults)
+    # Strategy params
     vwap_lookback = int(os.getenv("VWAP_LOOKBACK", "100"))
     atr_period = int(os.getenv("ATR_PERIOD", "14"))
-    atr_min = float(os.getenv("ATR_MIN", "0"))  # you can raise later if too noisy
+    atr_min = float(os.getenv("ATR_MIN", "0"))
     candle_limit_1m = int(os.getenv("CANDLE_LIMIT_1M", "240"))
-    candle_limit_15m = int(os.getenv("CANDLE_LIMIT_15M", "260"))  # needs >=200 for EMA200
+    candle_limit_15m = int(os.getenv("CANDLE_LIMIT_15M", "260"))  # needs >= 200 for EMA200
     poll_seconds = int(os.getenv("POLL_SECONDS", "30"))
+
+    client = PionexClient(api_key=api_key, api_secret=api_secret)
 
     logging.info(f"Mode: {trading_mode}")
     logging.info(f"Symbols: {','.join(symbols)}")
     logging.info(f"Guards: BOT_ENABLED={bot_enabled}, MIN_USDT_TO_TRADE={min_usdt_to_trade}, MAX_TRADES_PER_HOUR={max_trades_per_hour}")
     logging.info(f"Strategy: EMA(50/200) on 15m, Pullback+VWAP on 1m, ATR({atr_period}), VWAP_LOOKBACK={vwap_lookback}")
 
-    client = PionexClient(api_key=api_key, api_secret=api_secret)
-
     while True:
-        # balances (for info only in sim mode)
         usdt_free = 0.0
+
+        # balances
         try:
             r = client.get_balances()
             if r.get("result") is True:
@@ -404,20 +305,20 @@ def main():
         except Exception as e:
             logging.error(f"Balance check failed: {e}")
 
-        # prices (nice-to-have)
+        # prices
         try:
-            prices = client.get_prices_best_effort(symbols)
+            prices = client.get_prices(symbols)
             if prices:
                 pretty = " | ".join([f"{s}={prices[s]}" for s in prices])
                 logging.info(f"Prices: {pretty}")
         except Exception as e:
             logging.error(f"Price fetch failed: {e}")
 
-        # SIM signals per symbol
+        # strategy loop
         for sym in symbols:
             try:
-                c15 = client.get_candles_best_effort(sym, interval="15m", limit=candle_limit_15m)
-                c1 = client.get_candles_best_effort(sym, interval="1m", limit=candle_limit_1m)
+                c15 = client.get_candles(sym, interval_seconds=900, limit=candle_limit_15m)  # 15m
+                c1 = client.get_candles(sym, interval_seconds=60, limit=candle_limit_1m)    # 1m
 
                 if not c15 or not c1:
                     logging.warning(f"[SIM] {sym}: candle fetch failed (15m={bool(c15)} 1m={bool(c1)}).")
@@ -457,7 +358,6 @@ def main():
             except Exception as e:
                 logging.error(f"[SIM] {sym}: strategy loop error: {e}")
 
-        # trading gate (still NO orders)
         if bot_enabled and trading_mode.strip().lower() == "live":
             logging.warning("Trading is ARMED but this build is SIM-only (no orders implemented yet).")
         else:
