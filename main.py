@@ -29,6 +29,16 @@ def parse_symbols(raw: str) -> List[str]:
     return [p for p in parts if p]
 
 
+def to_binance_symbol(symbol: str) -> str:
+    # "SOL/USDT" -> "SOLUSDT"
+    return symbol.replace("/", "").upper()
+
+
+def to_pionex_symbol(symbol: str) -> str:
+    # "SOL/USDT" -> "SOL_USDT"
+    return symbol.replace("/", "_").upper()
+
+
 # ---------- indicators ----------
 def ema(values: List[float], period: int) -> Optional[float]:
     if period <= 0 or len(values) < period:
@@ -72,7 +82,7 @@ def vwap(highs: List[float], lows: List[float], closes: List[float], volumes: Li
     return tpv / vol
 
 
-# ----------(SIM): trend + pullback signal
+# ---------- Strategy D ----------
 def trend_state_15m(closes_15m: List[float]) -> str:
     e50 = ema(closes_15m, 50)
     e200 = ema(closes_15m, 200)
@@ -126,13 +136,8 @@ def pullback_signal_1m(
     return None
 
 
-# ---------- Pionex client ----------
+# ---------- Pionex (balances) ----------
 class PionexClient:
-    """
-    Minimal Pionex client:
-    - Private GET for balances (signed)
-    - Public GET for tickers + klines (no signature)
-    """
     def __init__(self, api_key: str, api_secret: str, base_url: str = "https://api.pionex.com"):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -169,97 +174,73 @@ class PionexClient:
         params = {"timestamp": self._now_ms()}
         if extra_params:
             params.update(extra_params)
-
         query = self._build_sorted_query(params)
         signature = self._sign("GET", path, query)
         headers = {"PIONEX-SIGNATURE": signature}
         url = f"{self.base_url}{path}?{query}"
-
         resp = self.session.get(url, headers=headers, timeout=15)
         data = resp.json()
         if not resp.ok:
             raise RuntimeError(f"HTTP {resp.status_code}: {data}")
         return data
 
-    def public_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        query = ""
-        if params:
-            query = self._build_sorted_query(params)
-        url = f"{self.base_url}{path}" + (f"?{query}" if query else "")
-        resp = self.session.get(url, timeout=15)
-        data = resp.json()
-        if not resp.ok:
-            raise RuntimeError(f"HTTP {resp.status_code} (public): {data}")
-        return data
-
-    # private
     def get_balances(self) -> Dict[str, Any]:
         return self.private_get("/api/v1/account/balances")
 
-    # public
-    def get_prices(self, symbols: List[str]) -> Dict[str, float]:
+
+# ---------- Binance candles ----------
+class BinanceMarketData:
+    def __init__(self, base_url: str = "https://api.binance.com"):
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+
+    def get_klines(self, symbol: str, interval: str, limit: int) -> Optional[List[Dict[str, float]]]:
         """
-        Uses market/tickers and filters in-code. Your logs showed this already works.
+        Binance:
+        GET /api/v3/klines?symbol=SOLUSDT&interval=1m&limit=500
+        Row format:
+        [
+          openTime, open, high, low, close, volume,
+          closeTime, quoteAssetVolume, numberOfTrades,
+          takerBuyBaseAssetVolume, takerBuyQuoteAssetVolume, ignore
+        ]
         """
-        prices: Dict[str, float] = {}
-        r = self.public_get("/api/v1/market/tickers")
-        if r.get("result") is not True:
-            return prices
-        data = r.get("data") or {}
-        tickers = data.get("tickers") or data.get("data") or data.get("list") or []
-        if not isinstance(tickers, list):
-            return prices
+        url = f"{self.base_url}/api/v3/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
 
-        wanted = {s.replace("/", "_"): s for s in symbols}  # SOL_USDT -> SOL/USDT
-        for t in tickers:
-            ts = t.get("symbol") or t.get("symbolName") or t.get("market")
-            if ts in wanted:
-                last = t.get("last") or t.get("close") or t.get("price")
-                if last is not None:
-                    prices[wanted[ts]] = float(last)
-        return prices
+        for attempt in range(1, 4):
+            try:
+                r = self.session.get(url, params=params, timeout=15)
+                if r.status_code == 429:
+                    time.sleep(1.5 * attempt)
+                    continue
+                r.raise_for_status()
+                raw = r.json()
+                if not isinstance(raw, list) or not raw:
+                    return None
 
-    def get_candles(self, symbol: str, interval_seconds: int, limit: int) -> Optional[List[Dict[str, float]]]:
-        """
-        Pionex klines:
-          GET /api/v1/market/klines?symbol=SOL_USDT&interval=60&limit=200
-        Returns rows like: [time, open, close, high, low, volume]
-        """
-        sym = symbol.replace("/", "_")  # SOL_USDT
-        r = self.public_get(
-            "/api/v1/market/klines",
-            params={"symbol": sym, "interval": interval_seconds, "limit": limit},
-        )
-        if r.get("result") is not True:
-            return None
+                candles: List[Dict[str, float]] = []
+                for row in raw:
+                    if not isinstance(row, list) or len(row) < 6:
+                        continue
+                    o = float(row[1])
+                    h = float(row[2])
+                    l = float(row[3])
+                    c = float(row[4])
+                    v = float(row[5])
+                    candles.append({"open": o, "high": h, "low": l, "close": c, "volume": v})
 
-        raw = (r.get("data") or {}).get("klines")
-        if raw is None:
-            # some APIs return list directly in data
-            raw = r.get("data")
-        if not isinstance(raw, list) or not raw:
-            return None
+                if len(candles) < 50:
+                    return None
+                return candles
+            except Exception:
+                time.sleep(0.6 * attempt)
 
-        candles: List[Dict[str, float]] = []
-        for row in raw:
-            if not isinstance(row, (list, tuple)) or len(row) < 6:
-                continue
-            _, o, c, h, l, v = row[:6]
-            candles.append({
-                "open": float(o),
-                "high": float(h),
-                "low": float(l),
-                "close": float(c),
-                "volume": float(v),
-            })
-
-        if len(candles) < 50:
-            return None
-        return candles
+        return None
 
 
 def main():
-    logging.info("Booting Pionex bot (SIM STRATEGY D)...")
+    logging.info("Booting Pionex bot (SIM STRATEGY D, Binance candles)...")
 
     api_key = require_env("PIONEX_API_KEY")
     api_secret = require_env("PIONEX_API_SECRET")
@@ -267,8 +248,8 @@ def main():
     trading_mode = os.getenv("TRADING_MODE", "paper")
     symbols = parse_symbols(os.getenv("SYMBOLS", "SOL/USDT,ARB/USDT"))
 
-    # Guardrails (still SIM-only, but keep for safety)
-    bot_enabled = env_bool("BOT_ENABLED", default=False)  # keep false
+    # Guardrails (SIM-only; still useful)
+    bot_enabled = env_bool("BOT_ENABLED", default=False)  # keep false for now
     min_usdt_to_trade = float(os.getenv("MIN_USDT_TO_TRADE", "10"))
     max_trades_per_hour = int(os.getenv("MAX_TRADES_PER_HOUR", "6"))
 
@@ -277,22 +258,26 @@ def main():
     atr_period = int(os.getenv("ATR_PERIOD", "14"))
     atr_min = float(os.getenv("ATR_MIN", "0"))
     candle_limit_1m = int(os.getenv("CANDLE_LIMIT_1M", "240"))
-    candle_limit_15m = int(os.getenv("CANDLE_LIMIT_15M", "260"))  # needs >= 200 for EMA200
+    candle_limit_15m = int(os.getenv("CANDLE_LIMIT_15M", "260"))  # needs >=200 for EMA200
     poll_seconds = int(os.getenv("POLL_SECONDS", "30"))
 
-    client = PionexClient(api_key=api_key, api_secret=api_secret)
+    binance_base = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
+
+    pionex = PionexClient(api_key=api_key, api_secret=api_secret)
+    market = BinanceMarketData(base_url=binance_base)
 
     logging.info(f"Mode: {trading_mode}")
     logging.info(f"Symbols: {','.join(symbols)}")
     logging.info(f"Guards: BOT_ENABLED={bot_enabled}, MIN_USDT_TO_TRADE={min_usdt_to_trade}, MAX_TRADES_PER_HOUR={max_trades_per_hour}")
     logging.info(f"Strategy: EMA(50/200) on 15m, Pullback+VWAP on 1m, ATR({atr_period}), VWAP_LOOKBACK={vwap_lookback}")
+    logging.info(f"Market data: Binance klines @ {binance_base}")
 
     while True:
         usdt_free = 0.0
 
-        # balances
+        # Pionex balances (live account)
         try:
-            r = client.get_balances()
+            r = pionex.get_balances()
             if r.get("result") is True:
                 balances = (r.get("data") or {}).get("balances", [])
                 for b in balances:
@@ -305,23 +290,15 @@ def main():
         except Exception as e:
             logging.error(f"Balance check failed: {e}")
 
-        # prices
-        try:
-            prices = client.get_prices(symbols)
-            if prices:
-                pretty = " | ".join([f"{s}={prices[s]}" for s in prices])
-                logging.info(f"Prices: {pretty}")
-        except Exception as e:
-            logging.error(f"Price fetch failed: {e}")
-
-        # strategy loop
+        # Strategy loop (Binance candles)
         for sym in symbols:
+            b_sym = to_binance_symbol(sym)
             try:
-                c15 = client.get_candles(sym, interval_seconds=900, limit=candle_limit_15m)  # 15m
-                c1 = client.get_candles(sym, interval_seconds=60, limit=candle_limit_1m)    # 1m
+                c15 = market.get_klines(b_sym, interval="15m", limit=candle_limit_15m)
+                c1 = market.get_klines(b_sym, interval="1m", limit=candle_limit_1m)
 
                 if not c15 or not c1:
-                    logging.warning(f"[SIM] {sym}: candle fetch failed (15m={bool(c15)} 1m={bool(c1)}).")
+                    logging.warning(f"[SIM] {sym}: Binance candle fetch failed (15m={bool(c15)} 1m={bool(c1)}).")
                     continue
 
                 closes_15 = [c["close"] for c in c15]
